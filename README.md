@@ -19,7 +19,7 @@ The first things you reached for after base install:
 1. hyprland
 2. waybar
 3. kitty
-...
+
 Chapter 2 — The Numbers
 Packages installed   1464
 Packages removed     26
