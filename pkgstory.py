@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import re
+import difflib
 import sys
 import argparse
 from collections import defaultdict
@@ -224,7 +225,14 @@ def render_pkg(pkg: str, all_events: list[dict]) -> int:
 
     if not pkg_events:
         console.print(f"\n[red]No history found for '{pkg}'[/red]")
-        console.print("[dim]Check the package name or try a partial match.[/dim]")
+        all_pkgs = list({e["pkg"] for e in all_events})
+        suggestions = difflib.get_close_matches(pkg, all_pkgs, n=3, cutoff=0.5)
+        if suggestions:
+            console.print("\n  did you mean:")
+            for s in suggestions:
+                console.print(f"    [cyan]pkgstory --pkg {s}[/cyan]")
+        else:
+            console.print("[dim]No similar packages found in your log.[/dim]")
         return 1
 
     console.print()
