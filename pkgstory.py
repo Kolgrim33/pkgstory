@@ -35,60 +35,97 @@ def parse_ts(ts_str: str) -> datetime:
     except Exception:
         return datetime.min.replace(tzinfo=timezone.utc)
 
-def parse_log(path: Path) -> list[dict]:
-    events = []
+def parse_log(path: Path) -> tuple[list[dict], list[dict]]:
+    """Returns (all_events, manual_events) where manual_events excludes
+    anything installed by archinstall (-r /mnt chroot transactions)."""
+
+    all_events: list[dict] = []
+    transaction = 0
+    in_transaction = False
+    chroot_transactions: set[int] = set()
+    current_tx_is_chroot = False
+
     for line in path.read_text(errors="replace").splitlines():
         m = LINE_RE.match(line)
         if not m:
             continue
-        ts = parse_ts(m.group("ts"))
+        ts  = parse_ts(m.group("ts"))
         src = m.group("src")
         msg = m.group("msg").strip()
 
+        if src == "PACMAN" and msg.startswith("Running"):
+            # Mark next transaction as chroot if -r /mnt present
+            if "-r /mnt" in msg:
+                current_tx_is_chroot = True
+
         if src == "ALPM":
+            if msg == "transaction started":
+                transaction += 1
+                in_transaction = True
+                if current_tx_is_chroot:
+                    chroot_transactions.add(transaction)
+                    current_tx_is_chroot = False
+                continue
+            if msg == "transaction completed":
+                in_transaction = False
+                current_tx_is_chroot = False
+                continue
+
             am = ALPM_RE.match(msg)
-            if am:
-                events.append({
-                    "ts": ts,
-                    "action": am.group("action"),
-                    "pkg": am.group("pkg"),
-                    "ver": am.group("ver"),
-                })
-    return events
+            if am and in_transaction:
+                event = {
+                    "ts":          ts,
+                    "action":      am.group("action"),
+                    "pkg":         am.group("pkg"),
+                    "ver":         am.group("ver"),
+                    "transaction": transaction,
+                    "chroot":      transaction in chroot_transactions,
+                }
+                all_events.append(event)
+
+    manual_events = [e for e in all_events if not e["chroot"]]
+    return all_events, manual_events
 
 # ── Analysis ──────────────────────────────────────────────────────────────────
 
-def analyse(events: list[dict]) -> dict:
-    if not events:
+def analyse(all_events: list[dict], manual_events: list[dict]) -> dict:
+    if not all_events:
         return {}
 
-    first = events[0]["ts"]
-    last  = events[-1]["ts"]
+    first = all_events[0]["ts"]
+    last  = all_events[-1]["ts"]
     age_days = max((last - first).days, 1)
 
-    installs   = [e for e in events if e["action"] == "installed"]
-    removes    = [e for e in events if e["action"] == "removed"]
-    upgrades   = [e for e in events if e["action"] == "upgraded"]
-    downgrades = [e for e in events if e["action"] == "downgraded"]
+    installs   = [e for e in all_events if e["action"] == "installed"]
+    removes    = [e for e in all_events if e["action"] == "removed"]
+    upgrades   = [e for e in all_events if e["action"] == "upgraded"]
+    downgrades = [e for e in all_events if e["action"] == "downgraded"]
 
-    # package install counts
-    pkg_install_count: dict[str, int] = defaultdict(int)
+    # base install = chroot installs
+    base_pkg_count = sum(1 for e in installs if e["chroot"])
+
+    # first manual installs
+    first_manual = []
+    for e in manual_events:
+        if e["action"] == "installed":
+            first_manual.append(e["pkg"])
+            if len(first_manual) >= 10:
+                break
+
+    # upgrade counts
     pkg_upgrade_count: dict[str, int] = defaultdict(int)
-    for e in installs:
-        pkg_install_count[e["pkg"]] += 1
     for e in upgrades:
         pkg_upgrade_count[e["pkg"]] += 1
 
-    # activity per day
+    # activity per day (all events)
     day_activity: dict[str, int] = defaultdict(int)
-    for e in events:
+    for e in all_events:
         day = e["ts"].strftime("%Y-%m-%d")
         day_activity[day] += 1
 
     busiest_day   = max(day_activity, key=day_activity.__getitem__)
     busiest_count = day_activity[busiest_day]
 
-    # update streaks — longest gap between days with activity
     active_days = sorted(day_activity.keys())
     longest_gap = 0
     if len(active_days) > 1:
@@ -98,37 +135,24 @@ def analyse(events: list[dict]) -> dict:
             gap = (d2 - d1).days
             longest_gap = max(longest_gap, gap)
 
-    # most upgraded packages
     most_upgraded = sorted(pkg_upgrade_count.items(), key=lambda x: x[1], reverse=True)[:5]
 
-    # first 10 packages installed (excluding base system bulk install)
-    # the first transaction is usually base install, skip it
-    first_manual = []
-    seen_ts = None
-    for e in installs:
-        if seen_ts is None:
-            seen_ts = e["ts"]
-        if e["ts"] == seen_ts:
-            continue  # skip base install batch
-        first_manual.append(e["pkg"])
-        if len(first_manual) >= 10:
-            break
-
     return {
-        "first_date":    first,
-        "last_date":     last,
-        "age_days":      age_days,
-        "total_installs": len(installs),
-        "total_removes":  len(removes),
-        "total_upgrades": len(upgrades),
+        "first_date":       first,
+        "last_date":        last,
+        "age_days":         age_days,
+        "total_installs":   len(installs),
+        "total_removes":    len(removes),
+        "total_upgrades":   len(upgrades),
         "total_downgrades": len(downgrades),
-        "busiest_day":   busiest_day,
-        "busiest_count": busiest_count,
-        "most_upgraded": most_upgraded,
-        "first_manual":  first_manual,
-        "active_days":   len(active_days),
-        "longest_gap":   longest_gap,
-        "day_activity":  day_activity,
+        "base_pkg_count":   base_pkg_count,
+        "busiest_day":      busiest_day,
+        "busiest_count":    busiest_count,
+        "most_upgraded":    most_upgraded,
+        "first_manual":     first_manual,
+        "active_days":      len(active_days),
+        "longest_gap":      longest_gap,
+        "day_activity":     day_activity,
     }
 
 # ── Story rendering ───────────────────────────────────────────────────────────
@@ -141,45 +165,43 @@ def render_story(stats: dict) -> None:
     ))
     console.print()
 
-    # Chapter 1 — The Beginning
+    # Chapter 1
     console.print(Rule("[bold]Chapter 1 — The Beginning[/bold]", style="cyan"))
     console.print()
     start = stats["first_date"].strftime("%B %d, %Y")
     console.print(f"  Your Arch journey began on [bold cyan]{start}[/bold cyan].")
-    console.print(f"  That was [bold]{stats['age_days']} days ago[/bold].\n")
+    console.print(f"  That was [bold]{stats['age_days']} days ago[/bold].")
+    console.print(f"  archinstall set up [bold]{stats['base_pkg_count']} packages[/bold] automatically.\n")
 
     if stats["first_manual"]:
-        console.print("  The first things you reached for after base install:")
+        console.print("  The first things [bold]you[/bold] chose to install after that:\n")
         for i, pkg in enumerate(stats["first_manual"], 1):
             console.print(f"    [cyan]{i}.[/cyan] {pkg}")
+    else:
+        console.print("  [dim]No manual installs detected yet.[/dim]")
     console.print()
 
-    # Chapter 2 — The Numbers
+    # Chapter 2
     console.print(Rule("[bold]Chapter 2 — The Numbers[/bold]", style="cyan"))
     console.print()
-
     table = Table(box=box.SIMPLE, show_header=False)
     table.add_column("Stat", style="dim")
     table.add_column("Value", style="bold")
-
     table.add_row("Packages installed",  str(stats["total_installs"]))
     table.add_row("Packages removed",    str(stats["total_removes"]))
     table.add_row("Packages upgraded",   str(stats["total_upgrades"]))
     if stats["total_downgrades"]:
         table.add_row("Packages downgraded", f"[yellow]{stats['total_downgrades']}[/yellow]")
     table.add_row("Days with activity",  str(stats["active_days"]))
-
     console.print(table)
     console.print()
 
-    # Chapter 3 — Chaos and Calm
+    # Chapter 3
     console.print(Rule("[bold]Chapter 3 — Chaos and Calm[/bold]", style="cyan"))
     console.print()
-
     busiest = datetime.strptime(stats["busiest_day"], "%Y-%m-%d").strftime("%B %d, %Y")
     console.print(f"  Your most chaotic day was [bold yellow]{busiest}[/bold yellow]")
     console.print(f"  — [bold]{stats['busiest_count']} package events[/bold] in a single day.\n")
-
     if stats["longest_gap"] > 1:
         console.print(f"  Your longest quiet streak: [bold]{stats['longest_gap']} days[/bold] without touching pacman.")
         if stats["longest_gap"] > 30:
@@ -190,7 +212,7 @@ def render_story(stats: dict) -> None:
             console.print("  [dim]couldn't stay away for long.[/dim]")
     console.print()
 
-    # Chapter 4 — Most Upgraded
+    # Chapter 4
     if stats["most_upgraded"]:
         console.print(Rule("[bold]Chapter 4 — The Frequent Flyers[/bold]", style="cyan"))
         console.print()
@@ -200,14 +222,12 @@ def render_story(stats: dict) -> None:
             console.print(f"  [cyan]{pkg:<30}[/cyan] {bar} [dim]{count}x[/dim]")
         console.print()
 
-    # Chapter 5 — Activity heatmap (last 17 days or all days)
+    # Chapter 5
     console.print(Rule("[bold]Chapter 5 — Activity Map[/bold]", style="cyan"))
     console.print()
     console.print("  Package events per day:\n")
-
     day_activity = stats["day_activity"]
     max_activity = max(day_activity.values()) if day_activity else 1
-
     for day in sorted(day_activity.keys()):
         count = day_activity[day]
         filled = int((count / max_activity) * 20)
@@ -215,7 +235,6 @@ def render_story(stats: dict) -> None:
         d = datetime.strptime(day, "%Y-%m-%d").strftime("%b %d")
         color = "red" if count == max_activity else "cyan" if count > max_activity * 0.5 else "dim"
         console.print(f"  [dim]{d}[/dim]  [{color}]{bar}[/{color}]  [dim]{count}[/dim]")
-
     console.print()
 
     # Closing
@@ -230,19 +249,18 @@ def render_story(stats: dict) -> None:
 
 def main() -> int:
     path = Path(sys.argv[1]) if len(sys.argv) > 1 else LOG_PATH
-
     if not path.exists():
         console.print(f"[red]Log not found:[/red] {path}")
         return 1
 
     console.print(f"[dim]Reading {path}...[/dim]")
-    events = parse_log(path)
+    all_events, manual_events = parse_log(path)
 
-    if not events:
+    if not all_events:
         console.print("[yellow]No package events found in log.[/yellow]")
         return 1
 
-    stats = analyse(events)
+    stats = analyse(all_events, manual_events)
     render_story(stats)
     return 0
 
