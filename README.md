@@ -31,6 +31,7 @@ Your most chaotic day was June 26, 2026
 — 957 package events in a single day.
 Your longest quiet streak: 3 days without touching pacman.
 
+
 Chapter 4 — The Frequent Flyers
 Packages you've upgraded the most:
 hyprpaper    █ 1x
@@ -38,9 +39,11 @@ mesa         █ 1x
 
 Chapter 5 — Activity Map
 Jun 26  ████████████████████  957
+
 Jun 27  ░░░░░░░░░░░░░░░░░░░░  6
+
 Jul 03  ██░░░░░░░░░░░░░░░░░░  127
-...
+
 
 ## Why it exists
 
